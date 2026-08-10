@@ -41,10 +41,27 @@ jobs:
           mkdir -p android/app/src/main/res/xml
           cp android_extras/device_filter.xml android/app/src/main/res/xml/device_filter.xml
 
+      - name: Fetch packages
+        working-directory: padforge
+        run: flutter pub get
+
+      - name: Patch file_picker Kotlin build config
+        # file_picker 11.x skips applying the Kotlin Gradle plugin when it
+        # detects AGP 9+, assuming built-in Kotlin support that Flutter's
+        # current template doesn't actually enable — so its Kotlin sources
+        # never compile and the build fails with "cannot find symbol
+        # FilePickerPlugin". Force the classic Kotlin plugin (with a modern
+        # Kotlin version) instead, matching what other plugins do.
+        run: |
+          FP_GRADLE=$(ls "$HOME"/.pub-cache/hosted/pub.dev/file_picker-*/android/build.gradle | head -1)
+          echo "Patching: $FP_GRADLE"
+          sed -i "s/kotlin_version = '1.8.22'/kotlin_version = '2.2.0'/" "$FP_GRADLE"
+          sed -i "s/^def isAgp9OrAbove.*/def isAgp9OrAbove = false/" "$FP_GRADLE"
+          grep -n "kotlin_version\|isAgp9OrAbove" "$FP_GRADLE"
+
       - name: Build APK
         working-directory: padforge
         run: |
-          flutter pub get
           flutter analyze || true
           flutter build apk --release
 
