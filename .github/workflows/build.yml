@@ -1,0 +1,61 @@
+name: Build PadForge APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Unpack app source
+        run: unzip -q padforge_app_source.zip
+
+      - name: Generate Android scaffolding
+        working-directory: padforge
+        run: flutter create --org com.padforge --project-name padforge --platforms=android .
+
+      - name: Apply USB-MIDI manifest
+        working-directory: padforge
+        run: |
+          cp android_extras/AndroidManifest_reference.xml android/app/src/main/AndroidManifest.xml
+          mkdir -p android/app/src/main/res/xml
+          cp android_extras/device_filter.xml android/app/src/main/res/xml/device_filter.xml
+
+      - name: Build APK
+        working-directory: padforge
+        run: |
+          flutter pub get
+          flutter analyze || true
+          flutter build apk --release
+
+      - name: Publish APK to apk-output branch
+        run: |
+          mkdir -p /tmp/apk-out
+          cp padforge/build/app/outputs/flutter-apk/app-release.apk /tmp/apk-out/PadForge.apk
+          cd /tmp/apk-out
+          git init -b apk-output
+          git config user.name padforge-ci
+          git config user.email ci@padforge.local
+          git add PadForge.apk
+          git commit -m "PadForge release APK"
+          git push --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" apk-output
