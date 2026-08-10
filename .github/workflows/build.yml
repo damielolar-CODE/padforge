@@ -9,7 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  # ---------------------------------------------------------------- ANDROID
+  android:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repo
@@ -34,12 +35,23 @@ jobs:
         working-directory: padforge
         run: flutter create --org com.padforge --project-name padforge --platforms=android .
 
-      - name: Apply USB-MIDI manifest
+      - name: Apply USB-MIDI + mic manifest
         working-directory: padforge
         run: |
           cp android_extras/AndroidManifest_reference.xml android/app/src/main/AndroidManifest.xml
           mkdir -p android/app/src/main/res/xml
           cp android_extras/device_filter.xml android/app/src/main/res/xml/device_filter.xml
+          echo "--- RECORD_AUDIO present? ---"
+          grep -c RECORD_AUDIO android/app/src/main/AndroidManifest.xml
+
+      - name: Raise Android compileSdk / minSdk
+        # flutter_soloud (CMake/NDK) and record_android both need a modern
+        # compileSdk; several transitive AARs now require 36.
+        working-directory: padforge
+        run: |
+          sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 36/' android/app/build.gradle.kts || true
+          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/' android/app/build.gradle.kts || true
+          grep -nE "compileSdk|minSdk" android/app/build.gradle.kts || true
 
       - name: Fetch packages
         working-directory: padforge
@@ -49,9 +61,8 @@ jobs:
         # file_picker 11.x skips applying the Kotlin Gradle plugin when it
         # detects AGP 9+, assuming built-in Kotlin support that Flutter's
         # current template doesn't actually enable — so its Kotlin sources
-        # never compile and the build fails with "cannot find symbol
-        # FilePickerPlugin". Force the classic Kotlin plugin (with a modern
-        # Kotlin version) instead, matching what other plugins do.
+        # never compile ("cannot find symbol FilePickerPlugin"). Force the
+        # classic Kotlin plugin with a modern Kotlin version.
         run: |
           FP_GRADLE=$(ls "$HOME"/.pub-cache/hosted/pub.dev/file_picker-*/android/build.gradle | head -1)
           echo "Patching: $FP_GRADLE"
@@ -59,20 +70,96 @@ jobs:
           sed -i "s/^def isAgp9OrAbove.*/def isAgp9OrAbove = false/" "$FP_GRADLE"
           grep -n "kotlin_version\|isAgp9OrAbove" "$FP_GRADLE"
 
-      - name: Build APK
+      - name: Analyze (report only)
+        working-directory: padforge
+        run: flutter analyze || true
+
+      - name: Build release APKs (split per ABI + universal)
         working-directory: padforge
         run: |
-          flutter analyze || true
+          flutter build apk --release --split-per-abi
           flutter build apk --release
+          ls -la build/app/outputs/flutter-apk/
 
-      - name: Publish APK to apk-output branch
+      - name: Publish APKs to apk-output branch
         run: |
           mkdir -p /tmp/apk-out
-          cp padforge/build/app/outputs/flutter-apk/app-release.apk /tmp/apk-out/PadForge.apk
+          cd padforge/build/app/outputs/flutter-apk
+          cp app-arm64-v8a-release.apk /tmp/apk-out/PadForge-arm64.apk
+          cp app-armeabi-v7a-release.apk /tmp/apk-out/PadForge-arm32.apk || true
+          cp app-release.apk /tmp/apk-out/PadForge-universal.apk
           cd /tmp/apk-out
+          ls -la
           git init -b apk-output
           git config user.name padforge-ci
           git config user.email ci@padforge.local
-          git add PadForge.apk
-          git commit -m "PadForge release APK"
+          git add .
+          git commit -m "PadForge release APKs (run ${{ github.run_number }})"
           git push --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" apk-output
+
+  # -------------------------------------------------------------------- iOS
+  ios:
+    runs-on: macos-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Unpack app source
+        run: unzip -q padforge_app_source.zip
+
+      - name: Generate iOS scaffolding
+        working-directory: padforge
+        run: flutter create --org com.padforge --project-name padforge --platforms=ios .
+
+      - name: Configure iOS Info.plist and deployment target
+        working-directory: padforge
+        run: |
+          PLIST=ios/Runner/Info.plist
+          /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string 'PadForge uses the microphone to record loops and audio takes.'" "$PLIST" \
+            || /usr/libexec/PlistBuddy -c "Set :NSMicrophoneUsageDescription 'PadForge uses the microphone to record loops and audio takes.'" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST" || true
+          echo "--- Info.plist ---"
+          /usr/libexec/PlistBuddy -c "Print" "$PLIST" | head -40
+          # flutter_soloud + record need a modern deployment target
+          sed -i '' "s/^# platform :ios.*/platform :ios, '13.0'/" ios/Podfile || true
+          sed -i '' "s/^platform :ios.*/platform :ios, '13.0'/" ios/Podfile || true
+          head -5 ios/Podfile
+
+      - name: Fetch packages
+        working-directory: padforge
+        run: flutter pub get
+
+      - name: Build iOS (no code signing — compile verification)
+        working-directory: padforge
+        run: flutter build ios --release --no-codesign
+
+      - name: Package Xcode-ready project
+        run: |
+          cd padforge
+          rm -rf build .dart_tool
+          cd ..
+          zip -q -r /tmp/PadForge-iOS-Xcode.zip padforge \
+            -x "padforge/build/*" "padforge/.dart_tool/*" \
+               "padforge/ios/Pods/*" "padforge/ios/.symlinks/*"
+          ls -lh /tmp/PadForge-iOS-Xcode.zip
+
+      - name: Publish iOS project to ios-output branch
+        run: |
+          mkdir -p /tmp/ios-out
+          cp /tmp/PadForge-iOS-Xcode.zip /tmp/ios-out/
+          cd /tmp/ios-out
+          git init -b ios-output
+          git config user.name padforge-ci
+          git config user.email ci@padforge.local
+          git add .
+          git commit -m "PadForge iOS Xcode project (run ${{ github.run_number }})"
+          git push --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ios-output
