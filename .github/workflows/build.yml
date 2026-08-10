@@ -117,7 +117,7 @@ jobs:
         working-directory: padforge
         run: flutter create --org com.padforge --project-name padforge --platforms=ios .
 
-      - name: Configure iOS Info.plist and deployment target
+      - name: Configure iOS Info.plist
         working-directory: padforge
         run: |
           PLIST=ios/Runner/Info.plist
@@ -129,14 +129,32 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST" || true
           echo "--- Info.plist ---"
           /usr/libexec/PlistBuddy -c "Print" "$PLIST" | head -40
-          # flutter_soloud + record need a modern deployment target
-          sed -i '' "s/^# platform :ios.*/platform :ios, '13.0'/" ios/Podfile || true
-          sed -i '' "s/^platform :ios.*/platform :ios, '13.0'/" ios/Podfile || true
-          head -5 ios/Podfile
 
       - name: Fetch packages
         working-directory: padforge
         run: flutter pub get
+
+      - name: Set iOS deployment target
+        # The Podfile only exists AFTER `flutter pub get` has seen the plugins,
+        # so this must run here, not earlier. flutter_soloud and record both
+        # require a modern deployment target.
+        working-directory: padforge
+        run: |
+          if [ ! -f ios/Podfile ]; then
+            echo "No Podfile yet; generating one via flutter precache/pub get."
+            flutter pub get
+          fi
+          if [ -f ios/Podfile ]; then
+            sed -i '' "s/^# *platform :ios.*/platform :ios, '13.0'/" ios/Podfile || true
+            sed -i '' "s/^platform :ios.*/platform :ios, '13.0'/" ios/Podfile || true
+            if ! grep -q "^platform :ios" ios/Podfile; then
+              printf "platform :ios, '13.0'\n%s" "$(cat ios/Podfile)" > ios/Podfile
+            fi
+            echo "--- Podfile head ---"
+            head -5 ios/Podfile
+          else
+            echo "WARNING: still no Podfile; letting flutter build generate it."
+          fi
 
       - name: Build iOS (no code signing — compile verification)
         working-directory: padforge
