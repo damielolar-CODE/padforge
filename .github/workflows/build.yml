@@ -44,6 +44,13 @@ jobs:
           echo "--- RECORD_AUDIO present? ---"
           grep -c RECORD_AUDIO android/app/src/main/AndroidManifest.xml
 
+      - name: Apply PadForge launcher icons
+        working-directory: padforge
+        run: |
+          cp -rf branding/android/mipmap-* android/app/src/main/res/
+          echo "--- launcher icons in place ---"
+          ls -l android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+
       - name: Raise Android compileSdk / minSdk
         # flutter_soloud (CMake/NDK) and record_android both need a modern
         # compileSdk; several transitive AARs now require 36.
@@ -129,6 +136,17 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST" || true
           echo "--- Info.plist ---"
           /usr/libexec/PlistBuddy -c "Print" "$PLIST" | head -40
+
+      - name: Apply PadForge app icons
+        working-directory: padforge
+        run: |
+          rm -rf ios/Runner/Assets.xcassets/AppIcon.appiconset
+          cp -r branding/ios/AppIcon.appiconset ios/Runner/Assets.xcassets/AppIcon.appiconset
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName PadForge" ios/Runner/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName PadForge" ios/Runner/Info.plist \
+            || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string PadForge" ios/Runner/Info.plist
+          echo "--- app icons in place ---"
+          ls ios/Runner/Assets.xcassets/AppIcon.appiconset | head -5
 
       - name: Fetch packages
         working-directory: padforge
@@ -234,6 +252,17 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" "$PLIST" || true
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST" || true
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST" || true
+
+      - name: Apply PadForge app icons
+        working-directory: padforge
+        run: |
+          rm -rf ios/Runner/Assets.xcassets/AppIcon.appiconset
+          cp -r branding/ios/AppIcon.appiconset ios/Runner/Assets.xcassets/AppIcon.appiconset
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName PadForge" ios/Runner/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName PadForge" ios/Runner/Info.plist \
+            || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string PadForge" ios/Runner/Info.plist
+          echo "--- app icons in place ---"
+          ls ios/Runner/Assets.xcassets/AppIcon.appiconset | head -5
 
       - name: Fetch packages
         working-directory: padforge
