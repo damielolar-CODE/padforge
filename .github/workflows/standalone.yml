@@ -1,0 +1,79 @@
+name: PadForge standalone Xcode
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ main ]
+permissions:
+  contents: write
+jobs:
+  standalone:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: unzip -q padforge_app_source.zip
+      - name: Prepare project
+        working-directory: padforge
+        run: |
+          flutter config --no-enable-swift-package-manager
+          flutter create --org com.padforge --project-name padforge --platforms=ios .
+          P=ios/Runner/Info.plist
+          /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string 'PadForge uses the microphone to record loops and audio takes.'" $P || true
+          /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" $P || true
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" $P || true
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" $P || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName PadForge" $P || true
+          rm -rf ios/Runner/Assets.xcassets/AppIcon.appiconset
+          cp -r branding/ios/AppIcon.appiconset ios/Runner/Assets.xcassets/AppIcon.appiconset
+          flutter pub get
+          sed -i '' -E "s/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;/IPHONEOS_DEPLOYMENT_TARGET = 14.0;/g" ios/Runner.xcodeproj/project.pbxproj
+          if [ -f ios/Podfile ]; then sed -i '' -E "s/^# *platform :ios.*/platform :ios, '14.0'/" ios/Podfile; fi
+      - name: Build the real iOS app
+        working-directory: padforge
+        run: |
+          flutter build ios --release --no-codesign
+          ls -1 build/ios/iphoneos/Runner.app/Frameworks
+          ls build/ios/iphoneos/Runner.app/Frameworks | grep -qi soloud || { echo "FATAL: soloud missing"; exit 1; }
+      - name: Assemble delivery folder
+        run: |
+          set -e
+          D=/tmp/PadForge-iOS
+          A=padforge/build/ios/iphoneos/Runner.app
+          rm -rf $D; mkdir -p $D/Frameworks
+          cp padforge/ios_host/AppDelegate.swift $D/
+          cp padforge/ios_host/Info.plist $D/
+          cp padforge/ios_host/PadForge-Bridging-Header.h $D/
+          cp padforge/ios_host/README-INSTALL.md $D/
+          cp padforge/ios/Runner/GeneratedPluginRegistrant.h $D/
+          cp padforge/ios/Runner/GeneratedPluginRegistrant.m $D/
+          cp -R padforge/ios/Runner/Assets.xcassets $D/
+          cp -R $A/Frameworks/*.framework $D/Frameworks/
+          test -d $D/Frameworks/App.framework/flutter_assets
+          ls -1 $D/Frameworks
+      - name: Generate Xcode project
+        run: |
+          gem list xcodeproj --installed || sudo gem install xcodeproj --no-document
+          ruby padforge/ios_host/make_xcodeproj.rb /tmp/PadForge-iOS /tmp/PadForge-iOS/Frameworks
+          ls -la /tmp/PadForge-iOS
+      - name: Verify it builds with NO Flutter
+        run: |
+          cd /tmp/PadForge-iOS
+          xcodebuild -project PadForge.xcodeproj -scheme PadForge -sdk iphoneos \
+            -configuration Release -derivedDataPath /tmp/dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGNING_IDENTITY= build
+      - name: Zip and publish
+        run: |
+          cd /tmp && du -sh PadForge-iOS
+          zip -q -r /tmp/out.zip PadForge-iOS
+          ls -lh /tmp/out.zip
+          mkdir -p /tmp/pub && cp /tmp/out.zip /tmp/pub/PadForge-iOS-Standalone.zip
+          cd /tmp/pub
+          git init -b ios-standalone-output
+          git config user.name ci
+          git config user.email ci@padforge.local
+          git add .
+          git commit -m "standalone run ${{ github.run_number }}"
+          git push --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ios-standalone-output
