@@ -45,11 +45,26 @@ jobs:
           grep -c RECORD_AUDIO android/app/src/main/AndroidManifest.xml
 
       - name: Apply PadForge launcher icons
+        # NOTE: `cp -r branding/android/mipmap-* res/` would nest the folders
+        # (res/mipmap-mdpi/mipmap-mdpi/...) because the destinations already
+        # exist, silently leaving Flutter's default icon in the build. Copy the
+        # FILES into each folder instead, then verify by checksum.
         working-directory: padforge
         run: |
-          cp -rf branding/android/mipmap-* android/app/src/main/res/
-          echo "--- launcher icons in place ---"
-          ls -l android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+          for d in branding/android/mipmap-*; do
+            n=$(basename "$d")
+            mkdir -p "android/app/src/main/res/$n"
+            cp -f "$d"/ic_launcher.png "android/app/src/main/res/$n/ic_launcher.png"
+          done
+          echo "--- verifying branded icons are in place ---"
+          fail=0
+          for d in branding/android/mipmap-*; do
+            n=$(basename "$d")
+            a=$(md5sum "$d/ic_launcher.png" | cut -d' ' -f1)
+            b=$(md5sum "android/app/src/main/res/$n/ic_launcher.png" | cut -d' ' -f1)
+            if [ "$a" = "$b" ]; then echo "  OK   $n"; else echo "  FAIL $n"; fail=1; fi
+          done
+          [ "$fail" = "0" ] || { echo "Branded launcher icons did not apply"; exit 1; }
 
       - name: Raise Android compileSdk / minSdk
         # flutter_soloud (CMake/NDK) and record_android both need a modern
