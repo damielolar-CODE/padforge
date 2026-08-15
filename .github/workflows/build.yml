@@ -1,0 +1,461 @@
+name: Build PadForge APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------- ANDROID
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Unpack app source
+        run: |
+          cat padforge_src_part_0* > padforge_app_source.zip
+          unzip -q padforge_app_source.zip
+
+      - name: Generate Android scaffolding
+        working-directory: padforge
+        run: flutter create --org com.padforge --project-name padforge --platforms=android .
+
+      - name: Apply USB-MIDI + mic manifest
+        working-directory: padforge
+        run: |
+          cp android_extras/AndroidManifest_reference.xml android/app/src/main/AndroidManifest.xml
+          mkdir -p android/app/src/main/res/xml
+          cp android_extras/device_filter.xml android/app/src/main/res/xml/device_filter.xml
+          echo "--- RECORD_AUDIO present? ---"
+          grep -c RECORD_AUDIO android/app/src/main/AndroidManifest.xml
+
+      - name: Apply PadForge launcher icons
+        # NOTE: `cp -r branding/android/mipmap-* res/` would nest the folders
+        # (res/mipmap-mdpi/mipmap-mdpi/...) because the destinations already
+        # exist, silently leaving Flutter's default icon in the build. Copy the
+        # FILES into each folder instead, then verify by checksum.
+        working-directory: padforge
+        run: |
+          for d in branding/android/mipmap-*; do
+            n=$(basename "$d")
+            mkdir -p "android/app/src/main/res/$n"
+            cp -f "$d"/ic_launcher.png "android/app/src/main/res/$n/ic_launcher.png"
+          done
+          echo "--- verifying branded icons are in place ---"
+          fail=0
+          for d in branding/android/mipmap-*; do
+            n=$(basename "$d")
+            a=$(md5sum "$d/ic_launcher.png" | cut -d' ' -f1)
+            b=$(md5sum "android/app/src/main/res/$n/ic_launcher.png" | cut -d' ' -f1)
+            if [ "$a" = "$b" ]; then echo "  OK   $n"; else echo "  FAIL $n"; fail=1; fi
+          done
+          [ "$fail" = "0" ] || { echo "Branded launcher icons did not apply"; exit 1; }
+
+      - name: Raise Android compileSdk / minSdk
+        # flutter_soloud (CMake/NDK) and record_android both need a modern
+        # compileSdk; several transitive AARs now require 36.
+        working-directory: padforge
+        run: |
+          sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 36/' android/app/build.gradle.kts || true
+          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/' android/app/build.gradle.kts || true
+          grep -nE "compileSdk|minSdk" android/app/build.gradle.kts || true
+
+      - name: Fetch packages
+        working-directory: padforge
+        run: flutter pub get
+
+      - name: Patch file_picker Kotlin build config
+        # file_picker 11.x skips applying the Kotlin Gradle plugin when it
+        # detects AGP 9+, assuming built-in Kotlin support that Flutter's
+        # current template doesn't actually enable — so its Kotlin sources
+        # never compile ("cannot find symbol FilePickerPlugin"). Force the
+        # classic Kotlin plugin with a modern Kotlin version.
+        run: |
+          FP_GRADLE=$(ls "$HOME"/.pub-cache/hosted/pub.dev/file_picker-*/android/build.gradle | head -1)
+          echo "Patching: $FP_GRADLE"
+          sed -i "s/kotlin_version = '1.8.22'/kotlin_version = '2.2.0'/" "$FP_GRADLE"
+          sed -i "s/^def isAgp9OrAbove.*/def isAgp9OrAbove = false/" "$FP_GRADLE"
+          grep -n "kotlin_version\|isAgp9OrAbove" "$FP_GRADLE"
+
+      - name: Analyze (report only)
+        working-directory: padforge
+        run: flutter analyze || true
+
+      - name: Build release APKs (split per ABI + universal)
+        working-directory: padforge
+        run: |
+          flutter build apk --release --split-per-abi
+          flutter build apk --release
+          ls -la build/app/outputs/flutter-apk/
+
+      - name: Publish APKs to apk-output branch
+        run: |
+          mkdir -p /tmp/apk-out
+          cd padforge/build/app/outputs/flutter-apk
+          cp app-arm64-v8a-release.apk /tmp/apk-out/PadForge-arm64.apk
+          cp app-armeabi-v7a-release.apk /tmp/apk-out/PadForge-arm32.apk || true
+          cp app-release.apk /tmp/apk-out/PadForge-universal.apk
+          cd /tmp/apk-out
+          ls -la
+          git init -b apk-output
+          git config user.name padforge-ci
+          git config user.email ci@padforge.local
+          git add .
+          git commit -m "PadForge release APKs (run ${{ github.run_number }})"
+          git push --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" apk-output
+
+  # -------------------------------------------------------------------- iOS
+  ios:
+    runs-on: macos-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Unpack app source
+        run: |
+          cat padforge_src_part_0* > padforge_app_source.zip
+          unzip -q padforge_app_source.zip
+
+      - name: Generate iOS scaffolding
+        working-directory: padforge
+        run: flutter create --org com.padforge --project-name padforge --platforms=ios .
+
+      - name: Configure iOS Info.plist
+        working-directory: padforge
+        run: |
+          PLIST=ios/Runner/Info.plist
+          /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string 'PadForge uses the microphone to record loops and audio takes.'" "$PLIST" \
+            || /usr/libexec/PlistBuddy -c "Set :NSMicrophoneUsageDescription 'PadForge uses the microphone to record loops and audio takes.'" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST" || true
+          echo "--- Info.plist ---"
+          /usr/libexec/PlistBuddy -c "Print" "$PLIST" | head -40
+
+      - name: Apply PadForge app icons
+        working-directory: padforge
+        run: |
+          rm -rf ios/Runner/Assets.xcassets/AppIcon.appiconset
+          cp -r branding/ios/AppIcon.appiconset ios/Runner/Assets.xcassets/AppIcon.appiconset
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName PadForge" ios/Runner/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName PadForge" ios/Runner/Info.plist \
+            || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string PadForge" ios/Runner/Info.plist
+          echo "--- app icons in place ---"
+          ls ios/Runner/Assets.xcassets/AppIcon.appiconset | head -5
+
+      - name: Fetch packages
+        working-directory: padforge
+        run: flutter pub get
+
+      - name: Set iOS deployment target
+        # flutter_soloud, record, and flutter_midi_command_darwin all need a
+        # modern minimum iOS version (midi-command-darwin requires >= 13.1).
+        # Current Flutter resolves plugins via Swift Package Manager, so the
+        # authoritative setting is IPHONEOS_DEPLOYMENT_TARGET inside the Xcode
+        # project — the Podfile alone is NOT enough. We set 14.0 for margin.
+        working-directory: padforge
+        run: |
+          PBX=ios/Runner.xcodeproj/project.pbxproj
+          sed -i '' -E "s/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;/IPHONEOS_DEPLOYMENT_TARGET = 14.0;/g" "$PBX"
+          echo "--- deployment targets in pbxproj ---"
+          grep -o "IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*;" "$PBX" | sort -u
+          if [ -f ios/Podfile ]; then
+            sed -i '' -E "s/^# *platform :ios.*/platform :ios, '14.0'/" ios/Podfile || true
+            sed -i '' -E "s/^platform :ios.*/platform :ios, '14.0'/" ios/Podfile || true
+            if ! grep -q "^platform :ios" ios/Podfile; then
+              printf "platform :ios, '14.0'\n%s" "$(cat ios/Podfile)" > ios/Podfile
+            fi
+            echo "--- Podfile head ---"
+            head -5 ios/Podfile
+          else
+            echo "No Podfile (Swift Package Manager path) — pbxproj setting governs."
+          fi
+          # AppFrameworkInfo.plist also carries a minimum version for the engine.
+          if [ -f ios/Flutter/AppFrameworkInfo.plist ]; then
+            /usr/libexec/PlistBuddy -c "Set :MinimumOSVersion 14.0" ios/Flutter/AppFrameworkInfo.plist || true
+          fi
+
+      - name: Build iOS (no code signing — compile verification)
+        working-directory: padforge
+        run: flutter build ios --release --no-codesign
+
+      - name: Package Xcode-ready project
+        run: |
+          cd padforge
+          rm -rf build .dart_tool
+          cd ..
+          zip -q -r /tmp/PadForge-iOS-Xcode.zip padforge \
+            -x "padforge/build/*" "padforge/.dart_tool/*" \
+               "padforge/ios/Pods/*" "padforge/ios/.symlinks/*"
+          ls -lh /tmp/PadForge-iOS-Xcode.zip
+
+      - name: Publish iOS project to ios-output branch
+        run: |
+          mkdir -p /tmp/ios-out
+          cp /tmp/PadForge-iOS-Xcode.zip /tmp/ios-out/
+          cd /tmp/ios-out
+          git init -b ios-output
+          git config user.name padforge-ci
+          git config user.email ci@padforge.local
+          git add .
+          git commit -m "PadForge iOS Xcode project (run ${{ github.run_number }})"
+          git push --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ios-output
+
+  # ------------------------------------------------- iOS (STANDALONE / NO SDK)
+  # Produces a plain Xcode project that embeds pre-built Flutter .xcframeworks.
+  # The user unzips it, double-clicks PadForge.xcodeproj, picks their Apple ID
+  # under Signing & Capabilities and presses Play. No Flutter SDK, no CocoaPods,
+  # no Terminal on their Mac.
+  ios-standalone:
+    runs-on: macos-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Unpack app source
+        run: |
+          cat padforge_src_part_0* > padforge_app_source.zip
+          unzip -q padforge_app_source.zip
+
+      - name: Disable Swift Package Manager
+        # `flutter build ios-framework` is a CocoaPods-era code path: it drives
+        # `xcodebuild -alltargets` inside ios/Pods to produce the plugin
+        # frameworks. SPM is enabled by default on stable now, so turn it off
+        # BEFORE `flutter create` / `pub get` so the project is generated in
+        # CocoaPods mode from the start and ios/Podfile exists when we patch the
+        # deployment target.
+        run: |
+          flutter config --no-enable-swift-package-manager
+          flutter config
+          flutter --version
+
+      - name: Generate iOS scaffolding
+        working-directory: padforge
+        run: flutter create --org com.padforge --project-name padforge --platforms=ios .
+
+      - name: Configure iOS Info.plist
+        working-directory: padforge
+        run: |
+          PLIST=ios/Runner/Info.plist
+          /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string 'PadForge uses the microphone to record loops and audio takes.'" "$PLIST" \
+            || /usr/libexec/PlistBuddy -c "Set :NSMicrophoneUsageDescription 'PadForge uses the microphone to record loops and audio takes.'" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST" || true
+
+      - name: Apply PadForge app icons
+        working-directory: padforge
+        run: |
+          rm -rf ios/Runner/Assets.xcassets/AppIcon.appiconset
+          cp -r branding/ios/AppIcon.appiconset ios/Runner/Assets.xcassets/AppIcon.appiconset
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName PadForge" ios/Runner/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName PadForge" ios/Runner/Info.plist \
+            || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string PadForge" ios/Runner/Info.plist
+          echo "--- app icons in place ---"
+          ls ios/Runner/Assets.xcassets/AppIcon.appiconset | head -5
+
+      - name: Fetch packages
+        working-directory: padforge
+        run: flutter pub get
+
+      - name: Set iOS deployment target
+        # Same handling as the `ios` job: flutter_midi_command_darwin needs
+        # >= 13.1, we use 14.0 for margin. The Podfile value is what governs the
+        # plugin frameworks that ios-framework builds out of ios/Pods.
+        working-directory: padforge
+        run: |
+          PBX=ios/Runner.xcodeproj/project.pbxproj
+          sed -i '' -E "s/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;/IPHONEOS_DEPLOYMENT_TARGET = 14.0;/g" "$PBX"
+          echo "--- deployment targets in pbxproj ---"
+          grep -o "IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*;" "$PBX" | sort -u
+          if [ -f ios/Podfile ]; then
+            sed -i '' -E "s/^# *platform :ios.*/platform :ios, '14.0'/" ios/Podfile || true
+            sed -i '' -E "s/^platform :ios.*/platform :ios, '14.0'/" ios/Podfile || true
+            if ! grep -q "^platform :ios" ios/Podfile; then
+              printf "platform :ios, '14.0'\n%s" "$(cat ios/Podfile)" > ios/Podfile
+            fi
+            echo "--- Podfile head ---"
+            head -5 ios/Podfile
+          else
+            echo "WARNING: no Podfile yet - ios-framework will create one."
+          fi
+          if [ -f ios/Flutter/AppFrameworkInfo.plist ]; then
+            /usr/libexec/PlistBuddy -c "Set :MinimumOSVersion 14.0" ios/Flutter/AppFrameworkInfo.plist || true
+          fi
+
+      - name: Build the real iOS app (this is what has EVERYTHING in it)
+        working-directory: padforge
+        # KEY CHANGE. The previous attempt used `flutter build ios-framework`,
+        # which silently OMITS ffiPlugin packages -- flutter_soloud (the audio
+        # engine) and path_provider never appeared, so the standalone project
+        # compiled but the app would have launched silent.
+        #
+        # A normal `flutter build ios` produces Runner.app, and Runner.app
+        # provably contains every framework the app actually needs, FFI
+        # plugins included. So we build it for real and harvest from it.
+        run: |
+          flutter build ios --release --no-codesign
+          APP=build/ios/iphoneos/Runner.app
+          echo "===================== Runner.app/Frameworks ====================="
+          ls -1 "$APP/Frameworks"
+          echo "================================================================="
+          # Fail loudly if the audio engine is missing -- that was the exact
+          # defect that made the last standalone attempt useless.
+          if ! ls "$APP/Frameworks" | grep -qi soloud; then
+            echo "FATAL: flutter_soloud framework not present in Runner.app."
+            exit 1
+          fi
+          echo "OK: flutter_soloud is present."
+
+      - name: Assemble PadForge-iOS delivery folder
+        run: |
+          set -e
+          DEST=/tmp/PadForge-iOS
+          APP=padforge/build/ios/iphoneos/Runner.app
+          rm -rf "$DEST"
+          mkdir -p "$DEST/Frameworks"
+
+          cp padforge/ios_host/AppDelegate.swift            "$DEST/"
+          cp padforge/ios_host/Info.plist                   "$DEST/"
+          cp padforge/ios_host/PadForge-Bridging-Header.h   "$DEST/"
+          cp padforge/ios_host/README-INSTALL.md            "$DEST/"
+
+          # The ObjC plugin registrant lives in the Flutter project itself when
+          # building a normal app (not a module).
+          for f in GeneratedPluginRegistrant.h GeneratedPluginRegistrant.m; do
+            if [ ! -f "padforge/ios/Runner/$f" ]; then
+              echo "FATAL: padforge/ios/Runner/$f not found."
+              ls -la padforge/ios/Runner
+              exit 1
+            fi
+            cp "padforge/ios/Runner/$f" "$DEST/"
+          done
+
+          cp -R padforge/ios/Runner/Assets.xcassets "$DEST/"
+
+          # Harvest every framework from the finished app bundle. These are
+          # already device-only (arm64) and release, so there is nothing to
+          # strip afterwards.
+          cp -R "$APP"/Frameworks/*.framework "$DEST/Frameworks/"
+
+          # flutter_assets (kits, fonts, the Dart snapshot's companion data)
+          # lives inside App.framework, which we just copied -- verify it.
+          if [ ! -d "$DEST/Frameworks/App.framework/flutter_assets" ]; then
+            echo "FATAL: App.framework has no flutter_assets."
+            exit 1
+          fi
+          echo "--- flutter_assets sample ---"
+          ls "$DEST/Frameworks/App.framework/flutter_assets" | head
+
+          echo "--- delivery folder ---"
+          ls -la "$DEST"
+          echo "--- frameworks (count: $(ls -1 "$DEST/Frameworks" | wc -l)) ---"
+          ls -1 "$DEST/Frameworks"
+
+      - name: Generate PadForge.xcodeproj
+        run: |
+          set -e
+          if ! ruby -e "require 'xcodeproj'" 2>/dev/null; then
+            echo "xcodeproj gem not visible to the default ruby - installing"
+            gem install xcodeproj --no-document \
+              || sudo gem install xcodeproj --no-document
+          fi
+          ruby -e "require 'xcodeproj'; puts 'xcodeproj ' + Xcodeproj::VERSION"
+          ruby padforge/ios_host/make_xcodeproj.rb /tmp/PadForge-iOS /tmp/PadForge-iOS/Frameworks
+          echo "--- generated project ---"
+          find /tmp/PadForge-iOS/PadForge.xcodeproj -type f | sort
+
+      - name: Verify the project builds WITHOUT Flutter (Release)
+        # This is the whole point of the job: if this passes, the user's Mac
+        # (which has no Flutter SDK) will succeed too. No `|| true` here.
+        working-directory: /tmp/PadForge-iOS
+        run: |
+          xcodebuild -project PadForge.xcodeproj -scheme PadForge \
+            -sdk iphoneos -configuration Release \
+            -derivedDataPath /tmp/dd-release \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGNING_IDENTITY="" \
+            build
+          echo "--- embedded frameworks in the built .app ---"
+          ls -la /tmp/dd-release/Build/Products/Release-iphoneos/PadForge.app/Frameworks
+
+      - name: Verify the project builds WITHOUT Flutter (Debug)
+        # Pressing Play in Xcode uses the scheme's Debug configuration, so verify
+        # that path too.
+        working-directory: /tmp/PadForge-iOS
+        run: |
+          xcodebuild -project PadForge.xcodeproj -scheme PadForge \
+            -sdk iphoneos -configuration Debug \
+            -derivedDataPath /tmp/dd-debug \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGNING_IDENTITY="" \
+            build
+
+      - name: Report size and zip
+        run: |
+          set -e
+          echo "===================== UNZIPPED ====================="
+          du -sh /tmp/PadForge-iOS
+          du -sh /tmp/PadForge-iOS/Frameworks/* | sort -h
+          cd /tmp
+          rm -f PadForge-iOS-Standalone.zip PadForge-iOS-Standalone.zip.part-*
+          zip -q -r -y PadForge-iOS-Standalone.zip PadForge-iOS
+          SIZE=$(stat -f%z PadForge-iOS-Standalone.zip)
+          echo "===================== ZIPPED ======================="
+          ls -lh PadForge-iOS-Standalone.zip
+          echo "zip size = $SIZE bytes ($((SIZE / 1024 / 1024)) MB)"
+          echo "GitHub hard-rejects any single file over 100 MB; threshold here is 95 MB."
+          if [ "$SIZE" -gt 95000000 ]; then
+            echo "SPLITTING: zip exceeds 95 MB, splitting into 90 MB parts."
+            split -b 90m PadForge-iOS-Standalone.zip PadForge-iOS-Standalone.zip.part-
+            rm PadForge-iOS-Standalone.zip
+            ls -lh PadForge-iOS-Standalone.zip.part-*
+            echo "NOTE: parts must be rejoined before unzipping:"
+            echo "      cat PadForge-iOS-Standalone.zip.part-* > PadForge-iOS-Standalone.zip"
+          else
+            echo "OK: fits in a single file, no split needed."
+          fi
+
+      - name: Publish to ios-standalone-output branch
+        run: |
+          mkdir -p /tmp/ios-standalone-out
+          cp /tmp/PadForge-iOS/README-INSTALL.md /tmp/ios-standalone-out/
+          cp /tmp/PadForge-iOS-Standalone.zip /tmp/ios-standalone-out/ 2>/dev/null || true
+          cp /tmp/PadForge-iOS-Standalone.zip.part-* /tmp/ios-standalone-out/ 2>/dev/null || true
+          cd /tmp/ios-standalone-out
+          ls -lh
+          git init -b ios-standalone-output
+          git config user.name padforge-ci
+          git config user.email ci@padforge.local
+          git add .
+          git commit -m "PadForge standalone iOS Xcode project (run ${{ github.run_number }})"
+          git push --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ios-standalone-output
