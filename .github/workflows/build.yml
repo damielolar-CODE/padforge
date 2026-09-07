@@ -77,6 +77,26 @@ jobs:
           sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/' android/app/build.gradle.kts || true
           grep -nE "compileSdk|minSdk" android/app/build.gradle.kts || true
 
+      - name: Configure release signing + applicationId
+        working-directory: padforge
+        env:
+          KS_B64: ${{ secrets.PADFORGE_KEYSTORE_B64 }}
+          KS_STORE_PASS: ${{ secrets.PADFORGE_STORE_PASSWORD }}
+          KS_KEY_PASS: ${{ secrets.PADFORGE_KEY_PASSWORD }}
+          KS_ALIAS: ${{ secrets.PADFORGE_KEY_ALIAS }}
+        run: |
+          set -e
+          if [ -z "$KS_B64" ]; then echo "No signing secret set — leaving debug signing."; exit 0; fi
+          echo "$KS_B64" | base64 -d > android/app/upload-keystore.jks
+          printf 'storePassword=%s\nkeyPassword=%s\nkeyAlias=%s\nstoreFile=upload-keystore.jks\n' \
+            "$KS_STORE_PASS" "$KS_KEY_PASS" "$KS_ALIAS" > android/key.properties
+          # Deliberate Play applicationId (the app has never shipped; the code
+          # namespace/MainActivity package stays as flutter-generated).
+          sed -i 's/applicationId = "[^"]*"/applicationId = "com.deestechhq.padforge"/' android/app/build.gradle.kts
+          python3 "$GITHUB_WORKSPACE/.github/scripts/inject_signing.py" android/app/build.gradle.kts
+          echo "--- applicationId + signingConfig now ---"
+          grep -nE "applicationId|signingConfig" android/app/build.gradle.kts
+
       - name: Fetch packages
         working-directory: padforge
         run: flutter pub get
@@ -98,12 +118,16 @@ jobs:
         working-directory: padforge
         run: flutter analyze || true
 
-      - name: Build release APKs (split per ABI + universal)
+      - name: Build release APKs + AAB (Play bundle)
         working-directory: padforge
         run: |
           flutter build apk --release --split-per-abi
           flutter build apk --release
+          flutter build appbundle --release
           ls -la build/app/outputs/flutter-apk/
+          ls -la build/app/outputs/bundle/release/
+          echo "--- AAB signing cert (should be the padforge upload key) ---"
+          "$JAVA_HOME/bin/keytool" -printcert -jarfile build/app/outputs/bundle/release/app-release.aab | grep -E "SHA256:|Owner:" | head || true
 
       - name: Publish APKs to apk-output branch
         run: |
@@ -120,6 +144,19 @@ jobs:
           git add .
           git commit -m "PadForge release APKs (run ${{ github.run_number }})"
           git push --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" apk-output
+
+      - name: Publish signed AAB to aab-output branch
+        run: |
+          mkdir -p /tmp/aab-out
+          cp padforge/build/app/outputs/bundle/release/app-release.aab /tmp/aab-out/PadForge-release.aab
+          cd /tmp/aab-out
+          ls -la
+          git init -b aab-output
+          git config user.name padforge-ci
+          git config user.email ci@padforge.local
+          git add .
+          git commit -m "PadForge signed release AAB (run ${{ github.run_number }})"
+          git push --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" aab-output
 
   # -------------------------------------------------------------------- iOS
   ios:
